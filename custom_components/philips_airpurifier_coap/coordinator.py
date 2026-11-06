@@ -17,6 +17,10 @@ _LOGGER = logging.getLogger(__name__)
 
 MISSED_PACKAGE_COUNT = 3
 
+# Limit on each teardown step, so that unload and reconnect can never hang on a
+# client or task that does not finish. aiocoap's own shutdown takes up to 3 s.
+TEARDOWN_TIMEOUT = 5
+
 
 class Coordinator:
     """Class to coordinate the data requests from the Philips API."""
@@ -40,6 +44,7 @@ class Coordinator:
 
         self._reconnect_task: Task | None = None
         self._timeout: int = 60
+        self._closed = False
 
         self._timer_disconnected = Timer(
             timeout=self._timeout * MISSED_PACKAGE_COUNT,
@@ -49,19 +54,54 @@ class Coordinator:
         self._timer_disconnected.setAutoRestart(True)
 
     async def shutdown(self):
-        """Shutdown the API connection."""
+        """Shutdown the API connection. Safe to repeat, and never raises."""
 
-        if self._reconnect_task is not None:
-            self._reconnect_task.cancel()
+        self._closed = True
 
         if self._timer_disconnected is not None:
-            self._timer_disconnected.cancel()
+            # Force the cancel: an unguarded Timer.cancel() raises
+            # CallbackRunningException if it lands while the timeout callback
+            # is running - which is exactly the case when we unload during a
+            # reconnect - and the auto-restarting timer would otherwise keep
+            # running after the entry is gone.
+            self._timer_disconnected.setAutoRestart(False)
+            self._timer_disconnected.cancel(msg="SHUTDOWN", force=True)
 
-        if self.client is not None:
-            await self.client.shutdown()
+        # Stop the observer before closing the client it is running on (PR #387).
+        await self._stop_tasks(self._task, self._reconnect_task)
+        self._task = None
+        self._reconnect_task = None
+
+        await self._close_client()
+
+    async def _stop_tasks(self, *tasks: Task | None) -> None:
+        """Cancel tasks and wait for them to finish, within a limit."""
+
+        running = [task for task in tasks if task is not None]
+        for task in running:
+            task.cancel()
+        if running:
+            await asyncio.wait(running, timeout=TEARDOWN_TIMEOUT)
+
+    async def _close_client(self) -> None:
+        """Forget the client, then close it.
+
+        Dropping the reference first means self.client can never point at a
+        closed client, whatever happens next. Closing an aiocoap context a
+        second time raises AttributeError, and anything raised here would leave
+        the config entry in FAILED_UNLOAD until Home Assistant is restarted.
+        """
+
+        client, self.client = self.client, None
+        if client is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(client.shutdown(), TEARDOWN_TIMEOUT)
 
     async def reconnect(self):
         """Reconnect to the API connection."""
+
+        if self._closed:
+            return
 
         try:
             if self._reconnect_task is not None:
@@ -77,8 +117,9 @@ class Coordinator:
         """Reconnect to the API connection."""
 
         try:
-            with contextlib.suppress(Exception):
-                await self.client.shutdown()
+            await self._stop_tasks(self._task)
+            self._task = None
+            await self._close_client()
             self.client = await CoAPClient.create(self.host)
             self._start_observing()
 
@@ -128,8 +169,8 @@ class Coordinator:
         self._listeners.remove(update_callback)
 
         if not self._listeners and self._task:
+            # Keep the reference: shutdown() has to wait for this task to finish.
             self._task.cancel()
-            self._task = None
 
     async def _async_observe_status(self) -> None:
         """Observe the status of the device."""
