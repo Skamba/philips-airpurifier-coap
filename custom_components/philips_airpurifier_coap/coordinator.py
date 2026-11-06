@@ -31,6 +31,16 @@ CONNECT_TIMEOUT = 8
 # also a fresh ARP lookup.
 CONNECT_RETRY_DELAY = 5
 
+# How long to wait for the first status of an observation before asking again.
+# This must stay well above the 80 s that an AC4236 on firmware @79 took not to
+# answer a new observe GET, because asking too soon only abandons a reply that
+# was still on its way. A lost GET costs this long; the watchdog still replaces
+# the client at 180 s, as it always did.
+FIRST_STATUS_TIMEOUT = 90
+
+# Pause before observing again, so that a persistent failure cannot spin.
+OBSERVE_RETRY_DELAY = 5
+
 
 class Coordinator:
     """Class to coordinate the data requests from the Philips API."""
@@ -204,19 +214,43 @@ class Coordinator:
             self._task.cancel()
 
     async def _async_observe_status(self) -> None:
-        """Observe the status of the device."""
+        """Keep the status of the device under observation, until cancelled."""
 
-        async for status in self.client.observe_status():
-            self.status = status
-            self._timer_disconnected.reset()
-            if self._outage:
-                self._outage = False
-                _LOGGER.info("Receiving status from %s again", self.host)
-            for update_callback in self._listeners:
-                update_callback()
+        while True:
+            try:
+                await self._observe_once()
+            except TimeoutError:
+                self._warn_once("No status from %s yet, asking again. It may just be idle", self.host)
+            await asyncio.sleep(OBSERVE_RETRY_DELAY)
+
+    async def _observe_once(self) -> None:
+        """Run one observation, on the current client.
+
+        A sync proves that the device answers, not that it will notify us, so
+        only a real status counts as having a working connection again. This
+        deliberately neither resets the watchdog nor replaces the client: a new
+        client has a new source port, and the device may keep pushing to the old
+        one for minutes. The watchdog replaces the client if this never works.
+        """
+
+        async with asyncio.timeout(FIRST_STATUS_TIMEOUT) as first_status:
+            async with contextlib.aclosing(self.client.observe_status()) as statuses:
+                async for status in statuses:
+                    first_status.reschedule(None)
+                    self.status = status
+                    self._timer_disconnected.reset()
+                    if self._outage:
+                        self._outage = False
+                        _LOGGER.info("Receiving status from %s again", self.host)
+                    for update_callback in self._listeners:
+                        update_callback()
 
     def _start_observing(self) -> None:
         """Schedule state observation."""
+
+        if self.client is None:
+            # A reconnect is running, and it starts the observation when it is done.
+            return
 
         if self._task:
             self._task.cancel()

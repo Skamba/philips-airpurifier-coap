@@ -8,6 +8,7 @@ import asyncio
 import logging
 import re
 from collections.abc import AsyncIterator, Callable
+from itertools import pairwise
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -31,6 +32,8 @@ def short_timeouts(monkeypatch: pytest.MonkeyPatch) -> None:
     """Shrink every delay so that the tests run quickly."""
     monkeypatch.setattr(coordinator_module, "CONNECT_TIMEOUT", 0.02)
     monkeypatch.setattr(coordinator_module, "CONNECT_RETRY_DELAY", 0.001)
+    monkeypatch.setattr(coordinator_module, "FIRST_STATUS_TIMEOUT", 0.01)
+    monkeypatch.setattr(coordinator_module, "OBSERVE_RETRY_DELAY", 0.001)
 
 
 @pytest.fixture
@@ -260,3 +263,184 @@ def test_no_entity_talks_to_the_client_directly() -> None:
     ]
 
     assert direct == []
+
+
+async def test_no_first_status_asks_again_on_the_same_client(script_create, make_coordinator) -> None:
+    """A lost observe GET is retried without replacing the client or its socket.
+
+    A new socket means a new source port, and a device that is still pushing to
+    the old port may not answer the new one for minutes. So the retry must not
+    add to the number of port changes.
+    """
+
+    create = script_create()
+    client = FakeClient()
+    coordinator = make_coordinator(client)
+
+    coordinator.async_add_listener(MagicMock())
+    await wait_until(lambda: client.observe_calls >= 3)
+
+    assert coordinator.client is client
+    assert client.shutdown_calls == 0
+    create.assert_not_called()
+
+
+async def test_status_after_a_retry_is_delivered(make_coordinator) -> None:
+    """An observation that answers on a later attempt works normally."""
+
+    client = FakeClient()
+    coordinator = make_coordinator(client)
+    listener = MagicMock()
+
+    coordinator.async_add_listener(listener)
+    await wait_until(lambda: client.observe_calls >= 2)
+    fresh = {"pwr": "0"}
+    client.push(fresh)
+
+    await wait_until(lambda: coordinator.status is fresh)
+    listener.assert_called()
+
+
+async def test_quiet_device_is_not_timed_out_after_its_first_status(make_coordinator) -> None:
+    """Only the first response has a deadline: later silence is for the watchdog."""
+
+    client = FakeClient()
+    coordinator = make_coordinator(client)
+    coordinator.async_add_listener(MagicMock())
+    client.push(STATUS)
+    await wait_until(lambda: coordinator.status is STATUS)
+
+    await asyncio.sleep(coordinator_module.FIRST_STATUS_TIMEOUT * 5)
+
+    assert client.observe_calls == 1
+
+
+async def test_successful_sync_does_not_end_the_outage(script_create, make_coordinator, caplog) -> None:
+    """A sync proves the device answers, not that the observation is alive."""
+
+    new_client = FakeClient()
+    script_create(LOST, new_client)
+    coordinator = make_coordinator(FakeClient())
+    coordinator.async_add_listener(MagicMock())
+
+    with caplog.at_level(logging.INFO, logger=coordinator_module.__name__):
+        await coordinator.reconnect()
+        await wait_until(lambda: coordinator.client is new_client)
+        await wait_until(lambda: new_client.observe_calls >= 2)
+
+        assert "Receiving status from" not in caplog.text
+
+        new_client.push(STATUS)
+        await wait_until(lambda: coordinator.status is STATUS)
+
+    assert "Receiving status from" in caplog.text
+    assert len(warnings_from_coordinator(caplog)) == 1
+
+
+async def test_new_client_gets_a_full_watchdog_window(script_create, make_coordinator) -> None:
+    """A reconnect just before the deadline must not be thrown away by the old deadline."""
+
+    new_client = FakeClient()
+    create = script_create(new_client)
+    coordinator = make_coordinator(FakeClient())
+    coordinator.async_add_listener(MagicMock())
+    coordinator._timer_disconnected.setTimeout(0.6)
+
+    await asyncio.sleep(0.4)
+    await coordinator.reconnect()
+    await wait_until(lambda: coordinator.client is new_client)
+    await asyncio.sleep(0.4)
+
+    assert create.call_count == 1
+    assert coordinator.client is new_client
+
+
+async def test_silent_device_warns_once(make_coordinator, caplog) -> None:
+    """Asking again and again in one outage produces one warning."""
+
+    client = FakeClient()
+    coordinator = make_coordinator(client)
+
+    with caplog.at_level(logging.WARNING, logger=coordinator_module.__name__):
+        coordinator.async_add_listener(MagicMock())
+        await wait_until(lambda: client.observe_calls >= 4)
+
+    assert len(warnings_from_coordinator(caplog)) == 1
+
+
+async def test_retries_do_not_hold_off_the_watchdog(script_create, make_coordinator) -> None:
+    """Sync OK, observe never answers: the watchdog must still replace the client.
+
+    If restarting the observation reset the watchdog, a device that never
+    answers would never be reconnected to.
+    """
+
+    replacement = FakeClient()
+    script_create(replacement)
+    client = FakeClient()
+    coordinator = make_coordinator(client)
+    coordinator.async_add_listener(MagicMock())
+    coordinator._timer_disconnected.setTimeout(0.1)
+
+    await wait_until(lambda: coordinator.client is replacement)
+
+    assert client.observe_calls > 1
+    assert client.closed
+
+
+async def test_outage_where_only_sync_works_recovers_on_a_fixed_cycle(script_create, make_coordinator) -> None:
+    """The failure of the fork: syncs answer, observes do not, for several rounds.
+
+    The device stays silent on three replacement clients, then answers. Recovery
+    must be automatic, and the time between replacements must not grow.
+    """
+
+    silent = [FakeClient() for _ in range(3)]
+    answering = FakeClient()
+    create = script_create(*silent, answering)
+    coordinator = make_coordinator(FakeClient())
+    coordinator.async_add_listener(MagicMock())
+    coordinator._timer_disconnected.setTimeout(0.05)
+    replaced_at = []
+    loop = asyncio.get_running_loop()
+
+    async with asyncio.timeout(5):
+        while coordinator.client is not answering:
+            if len(replaced_at) < create.call_count:
+                replaced_at.append(loop.time())
+            await asyncio.sleep(0.001)
+
+    fresh = {"pwr": "1", "pm25": 3}
+    answering.push(fresh)
+    await wait_until(lambda: coordinator.status is fresh)
+
+    gaps = [later - earlier for earlier, later in pairwise(replaced_at)]
+    assert create.call_count == 4
+    assert max(gaps) < min(gaps) * 3
+
+
+async def test_commands_work_while_waiting_for_the_first_status(make_coordinator) -> None:
+    """Issue #388: devices can stay silent for 2 h while still accepting commands."""
+
+    client = FakeClient()
+    coordinator = make_coordinator(client)
+    coordinator.async_add_listener(MagicMock())
+    await wait_until(lambda: client.observe_calls >= 2)
+
+    await coordinator.set_control_value("pwr", "1")
+
+    assert client.commands == [{"pwr": "1"}]
+
+
+async def test_first_listener_during_a_reconnect_waits_for_it(script_create, make_coordinator) -> None:
+    """With no client yet, the reconnect starts the observation when it is done."""
+
+    new_client = FakeClient()
+    script_create(LOST, new_client)
+    coordinator = make_coordinator(FakeClient())
+    await coordinator.reconnect()
+    await wait_until(lambda: coordinator.client is None)
+
+    coordinator.async_add_listener(MagicMock())
+
+    await wait_until(lambda: new_client.observe_calls >= 1)
