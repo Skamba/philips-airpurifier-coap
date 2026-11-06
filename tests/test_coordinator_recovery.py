@@ -616,3 +616,127 @@ async def test_cancelled_command_is_not_retried(script_create, make_coordinator)
             await command
 
     create.assert_not_called()
+
+
+async def test_malformed_notification_does_not_stop_observing(script_create, make_coordinator, caplog) -> None:
+    """The observe task must survive a corrupt notification (#396 section 2).
+
+    aioairctrl lets the ValueError from a NUL byte in the ciphertext escape from
+    observe_status() (aioairctrl#14). This must recover on the same client.
+    """
+
+    create = script_create()
+    client = FakeClient()
+    coordinator = make_coordinator(client)
+
+    with caplog.at_level(logging.WARNING, logger=coordinator_module.__name__):
+        coordinator.async_add_listener(MagicMock())
+        client.push(STATUS)
+        await wait_until(lambda: coordinator.status is STATUS)
+        client.push(ValueError("non-hexadecimal number found in fromhex()"))
+        await wait_until(lambda: client.observe_calls == 2)
+
+    assert "fromhex" in caplog.text
+    fresh = {"pwr": "0"}
+    client.push(fresh)
+    await wait_until(lambda: coordinator.status is fresh)
+    create.assert_not_called()
+
+
+async def test_observation_that_ends_without_an_error_restarts(make_coordinator, caplog) -> None:
+    """aioairctrl ends quietly when the device answers without the Observe option."""
+
+    client = FakeClient()
+    coordinator = make_coordinator(client)
+
+    with caplog.at_level(logging.WARNING, logger=coordinator_module.__name__):
+        coordinator.async_add_listener(MagicMock())
+        client.push(STATUS)
+        await wait_until(lambda: coordinator.status is STATUS)
+        client.end_observation()
+        await wait_until(lambda: client.observe_calls == 2)
+
+    assert len(warnings_from_coordinator(caplog)) == 1
+
+
+async def test_failing_listener_does_not_stop_observing(make_coordinator) -> None:
+    """An exception in an entity update must not end status delivery."""
+
+    client = FakeClient()
+    coordinator = make_coordinator(client)
+    coordinator.async_add_listener(MagicMock(side_effect=[KeyError("D03-02"), None]))
+    client.push(STATUS)
+
+    await wait_until(lambda: client.observe_calls == 2)
+
+    fresh = {"pwr": "0"}
+    client.push(fresh)
+    await wait_until(lambda: coordinator.status is fresh)
+
+
+async def test_observation_failing_on_every_attempt_still_reaches_the_watchdog(script_create, make_coordinator) -> None:
+    """Restarts must neither spin nor keep the watchdog from replacing the client."""
+
+    client = FakeClient()
+    await client.shutdown()
+    client.shutdown_calls = 0
+    client.closed = True
+    new_client = FakeClient()
+    script_create(new_client)
+    coordinator = make_coordinator(client)
+
+    coordinator.async_add_listener(MagicMock())
+    coordinator._timer_disconnected.setTimeout(0.05)
+
+    await wait_until(lambda: coordinator.client is new_client)
+    assert client.observe_calls > 1
+
+
+async def test_repeated_observation_failures_warn_once(make_coordinator, caplog) -> None:
+    """A device that keeps sending bad data must not flood the log."""
+
+    client = FakeClient()
+    coordinator = make_coordinator(client)
+
+    with caplog.at_level(logging.WARNING, logger=coordinator_module.__name__):
+        coordinator.async_add_listener(MagicMock())
+        for expected in range(1, 6):
+            client.push(ValueError("corrupt"))
+            await wait_until(lambda n=expected: client.observe_calls > n)
+
+    assert len(warnings_from_coordinator(caplog)) == 1
+
+
+async def test_shutdown_stops_a_pending_observation_restart(make_coordinator) -> None:
+    """Nothing may keep running on a coordinator that has been shut down."""
+
+    client = FakeClient()
+    coordinator = make_coordinator(client)
+    coordinator.async_add_listener(MagicMock())
+    task = coordinator._task
+    client.push(ValueError("corrupt"))
+    await wait_until(lambda: client.observe_calls == 1)
+
+    with patch.object(coordinator_module, "OBSERVE_RETRY_DELAY", 60):
+        client.push(ValueError("corrupt"))
+        await asyncio.sleep(0.01)
+        await coordinator.shutdown()
+
+    assert task.done()
+
+
+async def test_removing_the_last_listener_does_not_restart_observing(make_coordinator) -> None:
+    """Cancelling on purpose must not count as the observation dying."""
+
+    client = FakeClient()
+    coordinator = make_coordinator(client)
+    remove = coordinator.async_add_listener(MagicMock())
+    client.push(STATUS)
+    await wait_until(lambda: coordinator.status is STATUS)
+    task = coordinator._task
+
+    remove()
+    await asyncio.sleep(0.02)
+
+    assert task.done()
+    assert client.observe_calls == 1

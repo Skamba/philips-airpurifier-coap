@@ -261,8 +261,13 @@ class Coordinator:
         while True:
             try:
                 await self._observe_once()
+                self._warn_once("Observation of %s ended, observing again", self.host)
             except TimeoutError:
                 self._warn_once("No status from %s yet, asking again. It may just be idle", self.host)
+            except Exception as ex:
+                # For example a corrupt notification, which kills the observation
+                # in aioairctrl (aioairctrl#14). The client itself is still fine.
+                self._warn_once("Observation of %s failed, observing again (%r)", self.host, ex)
             await asyncio.sleep(OBSERVE_RETRY_DELAY)
 
     async def _observe_once(self) -> None:
