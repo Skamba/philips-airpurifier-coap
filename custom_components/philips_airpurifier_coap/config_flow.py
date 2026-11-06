@@ -66,6 +66,14 @@ class PhilipsAirPurifierConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._host = discovery_info.ip
         _LOGGER.debug("trying to configure host: %s", self._host)
 
+        # A probe sends an observe GET from this host, which would compete with
+        # the observation of the running coordinator.
+        if any(
+            entry.options.get(CONF_HOST, entry.data.get(CONF_HOST)) == self._host
+            for entry in self._async_current_entries()
+        ):
+            return self.async_abort(reason="already_configured")
+
         # let's try and connect to an AirPurifier
         try:
             client = None
