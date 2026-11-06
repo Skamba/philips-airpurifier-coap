@@ -464,6 +464,148 @@ async def test_command_with_no_reply_reconnects_and_retries(script_create, make_
     assert create.call_count == 1
 
 
+async def receive_status(coordinator: Coordinator, client: FakeClient) -> None:
+    """Make the observation deliver a status, so that the connection looks healthy."""
+    coordinator.async_add_listener(MagicMock())
+    client.push(STATUS)
+    await wait_until(lambda: coordinator.status is STATUS)
+
+
+async def test_lost_command_is_resent_on_a_healthy_connection(script_create, make_coordinator, caplog) -> None:
+    """A lost datagram must not cost a working observation (#363)."""
+
+    client = FakeClient()
+    client.command_results.append(HANG)
+    create = script_create()
+    coordinator = make_coordinator(client)
+    await receive_status(coordinator, client)
+
+    await coordinator.set_control_value("pwr", "1")
+
+    assert client.commands == [{"pwr": "1"}, {"pwr": "1"}]
+    assert create.call_count == 0
+    assert coordinator.client is client
+    assert warnings_from_coordinator(caplog) == []
+
+
+async def test_command_lost_twice_reconnects_and_retries(script_create, make_coordinator) -> None:
+    """The resend comes first, it does not replace the reconnect."""
+
+    client = FakeClient()
+    client.command_results.extend([HANG, HANG])
+    new_client = FakeClient()
+    create = script_create(new_client)
+    coordinator = make_coordinator(client)
+    await receive_status(coordinator, client)
+
+    await coordinator.set_control_value("pwr", "1")
+
+    assert len(client.commands) == 2
+    assert new_client.commands == [{"pwr": "1"}]
+    assert create.call_count == 1
+
+
+async def test_command_is_sent_at_most_three_times(script_create, make_coordinator) -> None:
+    """A dead connection ends in an error, however healthy it looked."""
+
+    client = FakeClient()
+    client.command_results.extend([HANG, HANG])
+    new_client = FakeClient()
+    new_client.command_results.append(HANG)
+    script_create(new_client)
+    coordinator = make_coordinator(client)
+    await receive_status(coordinator, client)
+
+    with pytest.raises(HomeAssistantError, match=re.escape(HOST)):
+        await coordinator.set_control_value("pwr", "1")
+
+    assert len(client.commands) + len(new_client.commands) == 3
+
+
+async def test_lost_command_reconnects_when_status_is_stale(script_create, make_coordinator) -> None:
+    """Old status is no evidence of a working connection, so do not delay recovery."""
+
+    client = FakeClient()
+    client.command_results.append(HANG)
+    new_client = FakeClient()
+    create = script_create(new_client)
+    coordinator = make_coordinator(client)
+    await receive_status(coordinator, client)
+    coordinator._timeout = 0
+
+    await coordinator.set_control_value("pwr", "1")
+
+    assert len(client.commands) == 1
+    assert new_client.commands == [{"pwr": "1"}]
+    assert create.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [NetworkError("gone"), LibraryShutdown(), ValueError("bad key"), False],
+    ids=["network", "shutdown", "bad-key", "rejected"],
+)
+async def test_only_a_lost_reply_is_resent(script_create, make_coordinator, failure) -> None:
+    """These say the client is unusable or the device refused, so resending cannot help."""
+
+    client = FakeClient()
+    client.command_results.append(failure)
+    new_client = FakeClient()
+    script_create(new_client)
+    coordinator = make_coordinator(client)
+    await receive_status(coordinator, client)
+
+    await coordinator.set_control_value("pwr", "1")
+
+    assert len(client.commands) == 1
+    assert new_client.commands == [{"pwr": "1"}]
+
+
+async def test_a_sync_is_not_recent_status(script_create, make_coordinator) -> None:
+    """A client that synced but never delivered a status has proved nothing."""
+
+    new_client = FakeClient()
+    new_client.command_results.append(HANG)
+    third_client = FakeClient()
+    create = script_create(new_client, third_client)
+    coordinator = make_coordinator(FakeClient())
+    coordinator.async_add_listener(MagicMock())
+    await coordinator.reconnect()
+    await wait_until(lambda: coordinator.client is new_client)
+
+    await coordinator.set_control_value("pwr", "1")
+
+    assert len(new_client.commands) == 1
+    assert third_client.commands == [{"pwr": "1"}]
+    assert create.call_count == 2
+
+
+async def test_command_is_not_resent_on_a_client_being_closed(script_create, make_coordinator, monkeypatch) -> None:
+    """aiocoap takes up to 3 s to close, and a resend must not land in that window."""
+
+    async def slow_shutdown() -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(coordinator_module, "COMMAND_TIMEOUT", 0.1)
+    monkeypatch.setattr(coordinator_module, "TEARDOWN_TIMEOUT", 0.4)
+    client = FakeClient()
+    client.shutdown = slow_shutdown
+    client.command_results.append(HANG)
+    new_client = FakeClient()
+    script_create(new_client)
+    coordinator = make_coordinator(client)
+    await receive_status(coordinator, client)
+
+    command = asyncio.create_task(coordinator.set_control_value("pwr", "1"))
+    await wait_until(lambda: client.commands)
+    await coordinator.reconnect()
+    await wait_until(lambda: coordinator.client is None)
+    await command
+
+    assert len(client.commands) == 1
+    assert new_client.commands == [{"pwr": "1"}]
+
+
 @pytest.mark.parametrize(
     "failure",
     [LibraryShutdown(), NetworkError("gone"), ValueError("bad key"), False],

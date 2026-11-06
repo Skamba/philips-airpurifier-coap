@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import logging
+import time
 from asyncio.tasks import Task
 from collections.abc import Callable
 from typing import Any
@@ -75,6 +76,7 @@ class Coordinator:
         self._timeout: int = 60
         self._closed = False
         self._outage = False
+        self._last_status: float | None = None
 
         self._timer_disconnected = Timer(
             timeout=self._timeout * MISSED_PACKAGE_COUNT,
@@ -176,7 +178,7 @@ class Coordinator:
 
         client = self._connected_client()
         try:
-            await self._send(client, data)
+            await self._send_or_resend(client, data)
         except Exception as ex:
             _LOGGER.warning("Command to %s failed, reconnecting and retrying once (%r)", self.host, ex)
         else:
@@ -196,6 +198,27 @@ class Coordinator:
         except Exception as ex:
             msg = f"Command to {self.host} failed: {ex!r}"
             raise HomeAssistantError(msg) from ex
+
+    async def _send_or_resend(self, client: CoAPClient, data: dict[str, Any]) -> None:
+        """Send control values, and once more if the reply is lost on a healthy connection.
+
+        A reconnect has a price: a new client has a new source port, and the
+        device may keep pushing to the old one for minutes. One lost datagram is
+        not worth that while status is still arriving (#363).
+        """
+
+        try:
+            await self._send(client, data)
+        except TimeoutError:
+            if self.client is not client or not self._status_is_recent():
+                raise
+            _LOGGER.info("Command to %s got no reply, sending it again", self.host)
+            await self._send(client, data)
+
+    def _status_is_recent(self) -> bool:
+        """Return whether a status arrived within the Max-Age of the device."""
+
+        return self._last_status is not None and time.monotonic() - self._last_status < self._timeout
 
     async def _send(self, client: CoAPClient, data: dict[str, Any]) -> None:
         """Send control values on a client, within a time limit."""
@@ -285,6 +308,7 @@ class Coordinator:
                 async for status in statuses:
                     first_status.reschedule(None)
                     self.status = status
+                    self._last_status = time.monotonic()
                     self._timer_disconnected.reset()
                     if self._outage:
                         self._outage = False
