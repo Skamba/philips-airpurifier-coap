@@ -13,12 +13,13 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from aiocoap.error import LibraryShutdown, NetworkError
 from homeassistant.exceptions import HomeAssistantError
 
 from custom_components.philips_airpurifier_coap import coordinator as coordinator_module
 from custom_components.philips_airpurifier_coap.coordinator import Coordinator
 
-from .fake_coap import FakeClient, wait_until
+from .fake_coap import HANG, FakeClient, wait_until
 
 HOST = "192.0.2.1"
 STATUS = {"pwr": "1"}
@@ -34,6 +35,8 @@ def short_timeouts(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(coordinator_module, "CONNECT_RETRY_DELAY", 0.001)
     monkeypatch.setattr(coordinator_module, "FIRST_STATUS_TIMEOUT", 0.01)
     monkeypatch.setattr(coordinator_module, "OBSERVE_RETRY_DELAY", 0.001)
+    monkeypatch.setattr(coordinator_module, "COMMAND_TIMEOUT", 0.02)
+    monkeypatch.setattr(coordinator_module, "RECONNECT_WAIT", 1)
 
 
 @pytest.fixture
@@ -444,3 +447,172 @@ async def test_first_listener_during_a_reconnect_waits_for_it(script_create, mak
     coordinator.async_add_listener(MagicMock())
 
     await wait_until(lambda: new_client.observe_calls >= 1)
+
+
+async def test_command_with_no_reply_reconnects_and_retries(script_create, make_coordinator) -> None:
+    """A lost command must not hang until a later reconnect kills it (bug 4, #363)."""
+
+    client = FakeClient()
+    client.command_results.append(HANG)
+    new_client = FakeClient()
+    create = script_create(new_client)
+    coordinator = make_coordinator(client)
+
+    await coordinator.set_control_value("pwr", "1")
+
+    assert new_client.commands == [{"pwr": "1"}]
+    assert create.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [LibraryShutdown(), NetworkError("gone"), ValueError("bad key"), False],
+    ids=["shutdown", "network", "bad-key", "rejected"],
+)
+async def test_failed_command_reconnects_and_retries(script_create, make_coordinator, failure) -> None:
+    """Every way a command can fail is retried, including a False return.
+
+    aioairctrl returns False when the device keeps replying "failed", and
+    raises ValueError on a corrupt sync key (aioairctrl#14).
+    """
+
+    client = FakeClient()
+    client.command_results.append(failure)
+    new_client = FakeClient()
+    script_create(new_client)
+    coordinator = make_coordinator(client)
+
+    await coordinator.set_control_value("pwr", "1")
+
+    assert new_client.commands == [{"pwr": "1"}]
+
+
+async def test_command_is_retried_only_once(script_create, make_coordinator) -> None:
+    """A second failure is reported, and does not loop."""
+
+    client = FakeClient()
+    client.command_results.append(HANG)
+    new_client = FakeClient()
+    new_client.command_results.append(HANG)
+    script_create(new_client)
+    coordinator = make_coordinator(client)
+
+    with pytest.raises(HomeAssistantError, match=re.escape(HOST)):
+        await coordinator.set_control_value("pwr", "1")
+
+    assert len(client.commands) == 1
+    assert len(new_client.commands) == 1
+
+
+async def test_rejected_retry_is_reported(script_create, make_coordinator) -> None:
+    """A command the device keeps refusing must not look like it succeeded."""
+
+    client = FakeClient()
+    client.command_results.append(False)
+    new_client = FakeClient()
+    new_client.command_results.append(False)
+    script_create(new_client)
+    coordinator = make_coordinator(client)
+
+    with pytest.raises(HomeAssistantError):
+        await coordinator.set_control_value("pwr", "1")
+
+
+async def test_concurrent_failures_share_one_reconnect(script_create, make_coordinator) -> None:
+    """A burst of commands from Node-RED must not start a reconnect each."""
+
+    client = FakeClient()
+    client.command_results.extend([HANG, HANG, HANG])
+    new_client = FakeClient()
+    create = script_create(new_client)
+    coordinator = make_coordinator(client)
+
+    await asyncio.gather(
+        coordinator.set_control_value("pwr", "1"),
+        coordinator.set_control_value("mode", "S"),
+        coordinator.set_control_value("uil", "0"),
+    )
+
+    assert create.call_count == 1
+    assert len(new_client.commands) == 3
+
+
+async def test_failure_on_an_already_replaced_client_does_not_reconnect_again(script_create, make_coordinator) -> None:
+    """A command that was in flight when the client was replaced just retries."""
+
+    client = FakeClient()
+    release = asyncio.Event()
+
+    async def blocked_until_replaced(data, retry_count=5, resync=True):
+        await release.wait()
+        raise LibraryShutdown
+
+    client.set_control_values = blocked_until_replaced
+    new_client = FakeClient()
+    create = script_create(new_client)
+    coordinator = make_coordinator(client)
+
+    with patch.object(coordinator_module, "COMMAND_TIMEOUT", 5):
+        command = asyncio.create_task(coordinator.set_control_value("pwr", "1"))
+        await asyncio.sleep(0)
+        await coordinator.reconnect()
+        await wait_until(lambda: coordinator.client is new_client)
+        release.set()
+        await command
+
+    assert create.call_count == 1
+    assert new_client.commands == [{"pwr": "1"}]
+
+
+async def test_command_gives_up_but_the_reconnect_carries_on(script_create, make_coordinator) -> None:
+    """A device still down fails the command, and must not stop the recovery."""
+
+    client = FakeClient()
+    client.command_results.append(HANG)
+    new_client = FakeClient()
+    create = script_create(*[LOST] * 20, new_client)
+    coordinator = make_coordinator(client)
+
+    with (
+        patch.object(coordinator_module, "RECONNECT_WAIT", 0.03),
+        pytest.raises(HomeAssistantError, match="reconnecting"),
+    ):
+        await coordinator.set_control_value("pwr", "1")
+
+    assert create.call_count < 20
+    await wait_until(lambda: coordinator.client is new_client)
+
+
+async def test_unload_during_a_failed_command_does_not_hang(script_create, make_coordinator) -> None:
+    """A command waiting for a reconnect is released when the entry unloads."""
+
+    client = FakeClient()
+    client.command_results.append(HANG)
+    script_create(*[LOST] * 1000)
+    coordinator = make_coordinator(client)
+
+    with patch.object(coordinator_module, "RECONNECT_WAIT", 30):
+        command = asyncio.create_task(coordinator.set_control_value("pwr", "1"))
+        await wait_until(lambda: coordinator.client is None)
+        await coordinator.shutdown()
+
+        with pytest.raises(HomeAssistantError):
+            await command
+
+
+async def test_cancelled_command_is_not_retried(script_create, make_coordinator) -> None:
+    """Cancelling a service call must stop it, not trigger a reconnect."""
+
+    client = FakeClient()
+    client.command_results.append(HANG)
+    create = script_create()
+    coordinator = make_coordinator(client)
+
+    with patch.object(coordinator_module, "COMMAND_TIMEOUT", 5):
+        command = asyncio.create_task(coordinator.set_control_value("pwr", "1"))
+        await wait_until(lambda: client.commands)
+        command.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await command
+
+    create.assert_not_called()

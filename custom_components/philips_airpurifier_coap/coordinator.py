@@ -41,6 +41,15 @@ FIRST_STATUS_TIMEOUT = 90
 # Pause before observing again, so that a persistent failure cannot spin.
 OBSERVE_RETRY_DELAY = 5
 
+# Commands are NON requests too, and are normally answered in about 0.25 s. This
+# leaves room for the three ARP broadcasts of a failed lookup, and for aioairctrl
+# to re-sync and resend after a "failed" reply.
+COMMAND_TIMEOUT = 8
+
+# How long a failed command waits for the reconnect before giving up: two sync
+# attempts. The reconnect itself carries on regardless.
+RECONNECT_WAIT = 2 * CONNECT_TIMEOUT + CONNECT_RETRY_DELAY
+
 
 class Coordinator:
     """Class to coordinate the data requests from the Philips API."""
@@ -160,9 +169,42 @@ class Coordinator:
         await self.set_control_values(data={key: value})
 
     async def set_control_values(self, data: dict[str, Any]) -> None:
-        """Send control values to the device."""
+        """Send control values to the device, reconnecting and retrying once on failure.
 
-        await self._connected_client().set_control_values(data=data)
+        Control writes set absolute values, so sending one twice is harmless.
+        """
+
+        client = self._connected_client()
+        try:
+            await self._send(client, data)
+        except Exception as ex:
+            _LOGGER.warning("Command to %s failed, reconnecting and retrying once (%r)", self.host, ex)
+        else:
+            return
+
+        if self.client is client:
+            await self.reconnect()
+        if self._reconnect_task is not None:
+            # asyncio.wait() leaves the task running on a timeout. Other commands
+            # may be waiting for it, and it has to continue either way.
+            await asyncio.wait([self._reconnect_task], timeout=RECONNECT_WAIT)
+
+        try:
+            await self._send(self._connected_client(), data)
+        except HomeAssistantError:
+            raise
+        except Exception as ex:
+            msg = f"Command to {self.host} failed: {ex!r}"
+            raise HomeAssistantError(msg) from ex
+
+    async def _send(self, client: CoAPClient, data: dict[str, Any]) -> None:
+        """Send control values on a client, within a time limit."""
+
+        async with asyncio.timeout(COMMAND_TIMEOUT):
+            # aioairctrl returns False when the device keeps refusing a command.
+            if not await client.set_control_values(data=data):
+                msg = f"Command to {self.host} was rejected by the device"
+                raise HomeAssistantError(msg)
 
     def _connected_client(self) -> CoAPClient:
         """Return the current client, or explain why there is none."""
