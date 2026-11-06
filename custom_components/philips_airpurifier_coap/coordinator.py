@@ -9,7 +9,7 @@ from typing import Any
 
 from aioairctrl import CoAPClient
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
 
 from .timer import Timer
 
@@ -143,6 +143,24 @@ class Coordinator:
         if not self._outage:
             self._outage = True
             _LOGGER.warning(msg, *args)
+
+    async def set_control_value(self, key: str, value: Any) -> None:
+        """Send one control value to the device."""
+
+        await self.set_control_values(data={key: value})
+
+    async def set_control_values(self, data: dict[str, Any]) -> None:
+        """Send control values to the device."""
+
+        await self._connected_client().set_control_values(data=data)
+
+    def _connected_client(self) -> CoAPClient:
+        """Return the current client, or explain why there is none."""
+
+        if self.client is None:
+            msg = f"Cannot reach {self.host}: reconnecting, try again shortly"
+            raise HomeAssistantError(msg)
+        return self.client
 
     async def async_first_refresh(self) -> None:
         """Refresh the data for the first time."""

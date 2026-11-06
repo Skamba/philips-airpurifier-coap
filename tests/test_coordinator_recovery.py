@@ -6,10 +6,13 @@ Each scenario here is a failure seen on real devices. See upstream issues #363,
 
 import asyncio
 import logging
+import re
 from collections.abc import AsyncIterator, Callable
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from homeassistant.exceptions import HomeAssistantError
 
 from custom_components.philips_airpurifier_coap import coordinator as coordinator_module
 from custom_components.philips_airpurifier_coap.coordinator import Coordinator
@@ -201,3 +204,59 @@ async def test_old_client_is_closed_exactly_once(script_create, make_coordinator
     await wait_until(lambda: coordinator.client is new_client)
 
     assert old_client.shutdown_calls == 1
+
+
+async def test_command_during_reconnect_fails_clearly(script_create, make_coordinator) -> None:
+    """A command with no client must raise HomeAssistantError, not AttributeError."""
+
+    script_create(LOST)
+    coordinator = make_coordinator(FakeClient())
+    await coordinator.reconnect()
+    await wait_until(lambda: coordinator.client is None)
+
+    with pytest.raises(HomeAssistantError, match="reconnecting"):
+        await coordinator.set_control_value("pwr", "1")
+    with pytest.raises(HomeAssistantError, match="reconnecting"):
+        await coordinator.set_control_values(data={"pwr": "1"})
+
+
+async def test_client_is_never_a_closed_client(script_create, make_coordinator) -> None:
+    """Bug 1: self.client stayed a closed client for the whole outage."""
+
+    closed_clients = []
+    old_client = FakeClient()
+    script_create(LOST, LOST, FakeClient())
+    coordinator = make_coordinator(old_client)
+
+    await coordinator.reconnect()
+    for _ in range(500):
+        if coordinator.client is not None and coordinator.client.closed:
+            closed_clients.append(coordinator.client)
+        await asyncio.sleep(0)
+
+    assert closed_clients == []
+
+
+async def test_commands_reach_the_client(make_coordinator) -> None:
+    """The wrappers send the same data the entities used to send directly."""
+
+    client = FakeClient()
+    coordinator = make_coordinator(client)
+
+    await coordinator.set_control_value("pwr", "1")
+    await coordinator.set_control_values(data={"mode": "S", "om": "1"})
+
+    assert client.commands == [{"pwr": "1"}, {"mode": "S", "om": "1"}]
+
+
+def test_no_entity_talks_to_the_client_directly() -> None:
+    """Every command must go through the coordinator, or it has no protection."""
+
+    component = Path(coordinator_module.__file__).parent
+    direct = [
+        path.name
+        for path in component.glob("*.py")
+        if path.name != "coordinator.py" and re.search(r"\.client\.set_control_value", path.read_text())
+    ]
+
+    assert direct == []
