@@ -11,6 +11,13 @@
 [community_forum_shield]: https://img.shields.io/static/v1.svg?label=%20&message=Forum&style=popout&color=41bdf5&logo=HomeAssistant&logoColor=white
 [community_forum]: https://community.home-assistant.io/t/philips-air-purifier/53030
 
+> [!NOTE]
+> This is a reliability fork of [kongo09/philips-airpurifier-coap](https://github.com/kongo09/philips-airpurifier-coap),
+> based on v0.37. It only changes how the integration recovers from a lost connection, so that it heals itself without
+> a Home Assistant restart. The domain, entities and supported devices are the same as v0.37. Install it from
+> [this repository's releases](https://github.com/Skamba/philips-airpurifier-coap/releases) as a HACS custom repository, and report problems with it
+> [here](https://github.com/Skamba/philips-airpurifier-coap/issues), not upstream. All credit for the integration goes to kongo09 and its contributors.
+
 This is a `Local Push` integration for Philips airpurifiers and humidifiers.
 Currently only encrypted-CoAP is implemented.
 

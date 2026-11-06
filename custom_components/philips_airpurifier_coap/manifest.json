@@ -32,13 +32,13 @@
       "registered_devices": true
     }
   ],
-  "documentation": "https://github.com/kongo09/philips-airpurifier-coap",
+  "documentation": "https://github.com/Skamba/philips-airpurifier-coap",
   "integration_type": "device",
   "iot_class": "local_push",
-  "issue_tracker": "https://github.com/kongo09/philips-airpurifier-coap/issues",
+  "issue_tracker": "https://github.com/Skamba/philips-airpurifier-coap/issues",
   "requirements": [
     "aioairctrl==0.3.1",
     "getmac>=0.9.4"
   ],
-  "version": "v0.37"
+  "version": "0.37.0-fork.1"
 }

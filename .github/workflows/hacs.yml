@@ -18,3 +18,5 @@ jobs:
         uses: "hacs/action@main"
         with:
           category: "integration"
+          # Upstream has no license GitHub can identify, and that is not for a fork to settle.
+          ignore: "license"
