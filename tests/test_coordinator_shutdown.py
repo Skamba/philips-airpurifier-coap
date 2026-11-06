@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from custom_components.philips_airpurifier_coap.coordinator import Coordinator
 
-from .fake_coap import FakeClient
+from .fake_coap import FakeClient, wait_until
 
 HOST = "10.0.0.1"
 
@@ -66,13 +66,17 @@ async def test_failed_reconnect_drops_the_dead_client() -> None:
 
     coordinator = _make_coordinator(client)
 
-    with patch(
-        "custom_components.philips_airpurifier_coap.coordinator.CoAPClient.create",
-        side_effect=TimeoutError,
+    with (
+        patch(
+            "custom_components.philips_airpurifier_coap.coordinator.CoAPClient.create",
+            side_effect=TimeoutError,
+        ) as create,
+        patch("custom_components.philips_airpurifier_coap.coordinator.CONNECT_RETRY_DELAY", 0.001),
     ):
-        await coordinator._reconnect()
+        await coordinator.reconnect()
+        await wait_until(lambda: create.call_count > 1)
 
-    assert coordinator.client is None
+        assert coordinator.client is None
 
     await coordinator.shutdown()
 

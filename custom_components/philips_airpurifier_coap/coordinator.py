@@ -21,6 +21,16 @@ MISSED_PACKAGE_COUNT = 3
 # client or task that does not finish. aiocoap's own shutdown takes up to 3 s.
 TEARDOWN_TIMEOUT = 5
 
+# The sync is a NON request that is never retransmitted, so a lost reply has to
+# be detected here. Replies normally take under 2.5 s, even when the host needs
+# all three ARP broadcasts (#396), and a lost one never arrives late.
+CONNECT_TIMEOUT = 8
+
+# Deliberately a flat delay and not a backoff: a long outage must not be followed
+# by a long wait to notice that it is over. Each retry is one small datagram, and
+# also a fresh ARP lookup.
+CONNECT_RETRY_DELAY = 5
+
 
 class Coordinator:
     """Class to coordinate the data requests from the Philips API."""
@@ -45,6 +55,7 @@ class Coordinator:
         self._reconnect_task: Task | None = None
         self._timeout: int = 60
         self._closed = False
+        self._outage = False
 
         self._timer_disconnected = Timer(
             timeout=self._timeout * MISSED_PACKAGE_COUNT,
@@ -98,38 +109,40 @@ class Coordinator:
                 await asyncio.wait_for(client.shutdown(), TEARDOWN_TIMEOUT)
 
     async def reconnect(self):
-        """Reconnect to the API connection."""
+        """Reconnect to the API connection, unless that is already happening."""
 
-        if self._closed:
+        if self._closed or (self._reconnect_task is not None and not self._reconnect_task.done()):
             return
 
-        try:
-            if self._reconnect_task is not None:
-                self._reconnect_task.cancel()
-                self._reconnect_task = None
-
-            self._reconnect_task = asyncio.create_task(self._reconnect())
-
-        except Exception:
-            _LOGGER.exception("Exception on starting reconnect!")
+        self._reconnect_task = asyncio.create_task(self._reconnect())
 
     async def _reconnect(self):
-        """Reconnect to the API connection."""
+        """Replace the client, retrying until the device answers a sync.
 
-        try:
-            await self._stop_tasks(self._task)
-            self._task = None
-            await self._close_client()
-            self.client = await CoAPClient.create(self.host)
-            self._start_observing()
+        Only one of these runs at a time, so a step that never finished would
+        end all recovery. Every await in here has a time limit.
+        """
 
-        except asyncio.CancelledError:
-            # Silently drop this exception, because we are responsible for it.
-            # Reconnect took to long
-            pass
+        await self._stop_tasks(self._task)
+        self._task = None
+        await self._close_client()
 
-        except Exception:
-            _LOGGER.exception("_reconnect error")
+        while True:
+            try:
+                self.client = await asyncio.wait_for(CoAPClient.create(self.host), CONNECT_TIMEOUT)
+                break
+            except Exception as ex:
+                self._warn_once("Lost connection to %s, retrying until it answers (%r)", self.host, ex)
+            await asyncio.sleep(CONNECT_RETRY_DELAY)
+
+        self._start_observing()
+
+    def _warn_once(self, msg: str, *args: Any) -> None:
+        """Log a warning, once per outage. A real status ends the outage."""
+
+        if not self._outage:
+            self._outage = True
+            _LOGGER.warning(msg, *args)
 
     async def async_first_refresh(self) -> None:
         """Refresh the data for the first time."""
@@ -178,6 +191,9 @@ class Coordinator:
         async for status in self.client.observe_status():
             self.status = status
             self._timer_disconnected.reset()
+            if self._outage:
+                self._outage = False
+                _LOGGER.info("Receiving status from %s again", self.host)
             for update_callback in self._listeners:
                 update_callback()
 
